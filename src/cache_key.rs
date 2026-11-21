@@ -5478,7 +5478,7 @@ impl StaticLibUse {
     /// never share a row.
     fn memo_namespace(self) -> &'static str {
         match self {
-            Self::Bundled => "static-ar-v8-bundled",
+            Self::Bundled => "static-ar-v9-bundled",
             Self::Linked => "static-ar-v8",
         }
     }
@@ -7529,11 +7529,15 @@ fn skip_ident_bytes(bytes: &[u8], mut i: usize) -> usize {
 
 /// Compute a linked `static=` archive's cache-key digest. A proven GNU/BSD
 /// archive gets the structural member-identity hash, unless the invocation
-/// links an archive with DWARF-bearing Mach-O members itself. Every other
-/// non-thin archive gets a digest of both its bytes and lexical absolute path
-/// because linkers can expose `archive-path(member)`. Thin archives are
-/// uncacheable: rustc reads external members whose bytes are absent from the
-/// container.
+/// links an archive with DWARF-bearing Mach-O members itself. On Windows an
+/// archive the invocation bundles (an rlib's, which never links it) gets a
+/// digest of its bytes and file name ([`bundled_archive_digest`]): its path
+/// never reaches the output there, and binding it would make the crate miss
+/// in every other checkout and target directory (kunobi-ninja/kache#2005).
+/// Every other non-thin archive gets a digest of both its bytes and lexical
+/// absolute path because linkers can expose `archive-path(member)`. Thin
+/// archives are uncacheable: rustc reads external members whose bytes are
+/// absent from the container.
 fn compute_static_lib_hash_for(
     path: &Path,
     usage: StaticLibUse,
@@ -7556,6 +7560,9 @@ fn compute_static_lib_hash_for(
     {
         return Ok(identity.digest);
     }
+    if cfg!(windows) && usage == StaticLibUse::Bundled {
+        return Ok(bundled_archive_digest(path, &bytes));
+    }
 
     let encoded_path = absolute.as_os_str().as_encoded_bytes();
     let mut hasher = blake3::Hasher::new();
@@ -7565,6 +7572,24 @@ fn compute_static_lib_hash_for(
     hasher.update(&(bytes.len() as u64).to_le_bytes());
     hasher.update(&bytes);
     Ok(format!("path-ar-v1:{}", hasher.finalize().to_hex()))
+}
+
+/// The digest of an archive an invocation bundles where its path cannot
+/// reach the output: its bytes and the place it is found by, its file name
+/// (the name an `-l` spec resolves). The directory, which differs between
+/// checkouts and target directories, stays out (kunobi-ninja/kache#2005).
+fn bundled_archive_digest(path: &Path, bytes: &[u8]) -> String {
+    let name = path
+        .file_name()
+        .map(|name| name.as_encoded_bytes())
+        .unwrap_or_default();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"kache.native-ar.bundled.v1\0");
+    hasher.update(&(name.len() as u64).to_le_bytes());
+    hasher.update(name);
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+    format!("bundled-ar-v1:{}", hasher.finalize().to_hex())
 }
 
 /// Result of a dep-info pre-pass. Contains all information discovered by

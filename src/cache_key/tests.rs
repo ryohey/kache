@@ -11160,6 +11160,48 @@ fn static_lib_fallback_binds_lexical_archive_path() {
     assert_ne!(first_hash, second_hash);
 }
 
+/// On Windows an archive an rlib bundles keys by its bytes and file name,
+/// not its directory, so the crate hits from another checkout or target
+/// directory (kunobi-ninja/kache#2005). A link of it stays path-bound.
+#[cfg(windows)]
+#[test]
+fn bundled_archive_keys_by_bytes_and_name_across_directories() {
+    let dir = tempfile::tempdir().unwrap();
+    let fh = FileHasher::new();
+    let hash_in = |sub: &str, name: &str, bytes: &[u8], usage: StaticLibUse| {
+        let lib_dir = dir.path().join(sub).join("target/debug/build/gpui/out");
+        std::fs::create_dir_all(&lib_dir).unwrap();
+        let lib = lib_dir.join(name);
+        std::fs::write(&lib, bytes).unwrap();
+        fh.hash_static_lib_for(&lib, usage).unwrap()
+    };
+    // Not a proven GNU/BSD archive: a resource compiled by `rc` into a COFF
+    // object, as `embed-resource` makes one.
+    let resource = b"!<arch>\n/               0           0     0     0       4         `\n\0\0\0\0";
+
+    let here = hash_in("worktree-a", "gpui.lib", resource, StaticLibUse::Bundled);
+    assert!(here.starts_with("bundled-ar-v1:"), "{here}");
+    assert_eq!(
+        here,
+        hash_in("worktree-b", "gpui.lib", resource, StaticLibUse::Bundled)
+    );
+    assert_ne!(
+        here,
+        hash_in("worktree-b", "other.lib", resource, StaticLibUse::Bundled)
+    );
+    assert_ne!(
+        here,
+        hash_in("worktree-b", "gpui.lib", b"!<arch>\nother", StaticLibUse::Bundled)
+    );
+
+    let linked = hash_in("worktree-a", "gpui.lib", resource, StaticLibUse::Linked);
+    assert!(linked.starts_with("path-ar-v1:"), "{linked}");
+    assert_ne!(
+        linked,
+        hash_in("worktree-b", "gpui.lib", resource, StaticLibUse::Linked)
+    );
+}
+
 /// A link through Cargo's `OUT_DIR` symlink into a sealed hermetic
 /// directory keys the archive by content; anything else stays resolved.
 #[cfg(unix)]
@@ -11331,7 +11373,7 @@ fn hash_static_lib_memo_rows_are_per_use() {
     let fingerprint = FileFingerprint::from_path(&lib).unwrap();
     let cache = fh.cache.as_ref().expect("persistent cache opens");
     for (namespace, expected) in [
-        ("static-ar-v8-bundled", &bundled),
+        ("static-ar-v9-bundled", &bundled),
         ("static-ar-v8", &linked),
     ] {
         let key = FileFingerprint {
